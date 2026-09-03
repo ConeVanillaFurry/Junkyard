@@ -1,0 +1,315 @@
+local PhotonLib = {}
+
+assert(typeof(WebSocket) ~= "function", "Photon must have websocket support.")
+
+local function JSONDecode(Targ)
+	return game:GetService("HttpService"):JSONDecode(Targ)
+end
+
+local function JSONEncode(Targ)
+	return game:GetService("HttpService"):JSONEncode(Targ)
+end
+
+local function GET(...)
+	return (game.HttpGet and game:HttpGet(...) or game:GetService("HttpService"):GetAsync(...))
+end
+
+local function POST(...)
+	return (game.HttpPost and game:HttpPost(...) or game:GetService("HttpService"):PostAsync(...))
+end
+
+local API = "https://ws-relay.conefurry.workers.dev"
+local API_WSS = "wss://ws-relay.conefurry.workers.dev"
+
+-- Any Action starting with this is delivered to EVERY client via
+-- PacketTransparent, regardless of master status -- no master routing.
+local TRANSPARENT_PREFIX = "_Transparent_"
+
+local CurrentSession = nil
+
+--[[
+Creates or joins a room. Set these up on the returned API:
+	function Room:RoomLoaded()                         -- Fires when the room is loaded.
+	function Room:PlayerJoined(Id)                     -- Fires with the ID that joined.
+	function Room:PlayerLeft(Id)                       -- Fires with the ID that left.
+	function Room:PacketRaised(Id, Action, Data)       -- master-client only, packet information sent to you as the master.
+	function Room:PacketRecieved(Action, Data)         -- Gives packet information from the master-client.
+	function Room:PacketTransparent(Id, Action, Data)  -- every client, Action starts with _Transparent_
+--]]
+function PhotonLib:JoinOrCreate(Room: string, MaxPlayers: number, DefaultGameData)
+	if CurrentSession then
+		return {error = "Already connected to a room"}
+	end
+
+	local Stage = 0
+	local Success, Result = pcall(function()
+		local function Bump()
+			Stage += 1
+		end
+
+		local FixedRoom = game:GetService("HttpService"):UrlEncode(Room)
+		local RoomData = JSONDecode(GET(API .. "/room/check?room=" .. FixedRoom))
+
+		if not RoomData["room_exists"] then
+			POST(API .. "/room/create?room=" .. FixedRoom .. "&maxUsers=" .. game:GetService("HttpService"):UrlEncode(tostring(tonumber(MaxPlayers))), "")
+		else
+			if RoomData["current_users"] == RoomData["max_users"] then
+				return {error = "Requested Room is full"}
+			end
+		end
+		Bump()
+
+		local ConnectOk, ConnectResult = pcall(function()
+			return WebSocket.connect(API_WSS .. "/ws?room=" .. FixedRoom)
+		end)
+
+		if not ConnectOk then
+			return {error = "Failed to connect to server: " .. ConnectResult}
+		end
+
+		local Connection = ConnectResult
+		Bump()
+
+		local RetData = {
+			Room = Room,
+			Connected = true,
+			LocalUniqueIdentifier = "",
+			PlayerList = {},
+			MasterClient = nil,
+			IsMasterClient = false,
+			SharedGameData = nil,
+			DefaultGameData = (DefaultGameData and typeof(DefaultGameData) == "table") and DefaultGameData or {}
+		}
+
+		task.spawn(function()
+			Connection.OnClose:Connect(function()
+				print("Connection snapped.")
+				RetData.Connected = false
+			end)
+		end)
+
+		CurrentSession = RetData
+
+		function RetData:SendPacketData(Data)
+			assert(Data ~= nil, "You must have at least one argument")
+			assert(Data[1] ~= nil, "You must have at least one argument")
+			assert(Data[1].Action ~= nil, "Invalid packet: {Action = \"Name\", Data = \"Value\"}")
+			assert(Data[1].Data ~= nil, "Invalid packet: {Action = \"Name\", Data = \"Value\"}")
+			assert(typeof(Data[1].Data) == "string", "Data must be a string")
+			assert(typeof(Data[1].Action) == "string", "Action must be a string")
+			Connection:Send(JSONEncode(Data))
+		end
+
+		function RetData:Disconnect()
+			RetData.Connected = false
+		end
+
+		function RetData:RoomLoaded()
+			warn("RoomLoaded was not set up!")
+		end
+
+		--Silent, replace to have it update every 30 Hz
+		function RetData:Update30Hz()
+
+		end
+
+		function RetData:PacketRecieved(Action, Data)
+			warn("PacketRecieved was not set up!")
+		end
+
+		function RetData:PacketRaised(Id, Action, Data)
+			warn("PacketRaised was not set up!")
+		end
+
+		function RetData:PacketTransparent(Id, Action, Data)
+			warn("PacketTransparent was not set up!")
+		end
+
+		function RetData:PlayerLeft(Id)
+			warn("PlayerLeft was not set up!")
+		end
+
+		function RetData:PlayerJoined(Id)
+			warn("PlayerJoined was not set up!")
+		end
+
+		local function ProxiedPacketRecieved(Action, Data)
+			if Action == "Internal_UpdateGameData" then
+				--print("Internal Data updated!")
+				-- Data arrives as a JSON string from SendPacketData, decode it back.
+				RetData.SharedGameData = JSONDecode(Data)
+				return
+			end
+			RetData:PacketRecieved(Action, Data)
+		end
+
+		local function SuspectedMaster()
+			if RetData.SharedGameData == nil then
+				RetData.SharedGameData = RetData.DefaultGameData
+			end
+		end
+
+		local function UpdateMaster()
+			local LowestOrder, LowestPlayer = math.huge, nil
+			for _, V in pairs(RetData.PlayerList) do
+				if V.join_order < LowestOrder then
+					LowestOrder = V.join_order
+					LowestPlayer = V.ip_hash
+				end
+			end
+
+			RetData.MasterClient = LowestPlayer
+			RetData.IsMasterClient = (RetData.LocalUniqueIdentifier == LowestPlayer)
+
+			task.spawn(function()
+				if RetData.IsMasterClient then SuspectedMaster() end
+			end)
+
+			return LowestPlayer
+		end
+
+		local FirstTime = true
+		local LastUserPing = tick()
+
+		Connection.OnMessage:Connect(function(Str)
+			-- Skip heartbeat responses; JSONDecode would error on "pong".
+			if Str == "pong" then LastUserPing = tick() return end
+
+			local DecodeOk, Msg = pcall(JSONDecode, Str)
+			if not DecodeOk then return end
+
+			if Msg.type == "welcome" then
+				RetData.LocalUniqueIdentifier = Msg.you.ip_hash
+				local Players = table.clone(Msg.members)
+				table.insert(Players, Msg.you)
+				RetData.PlayerList = Players
+				UpdateMaster()
+				if RetData.IsMasterClient and FirstTime then
+					FirstTime = false
+					RetData:RoomLoaded()
+				end
+
+			elseif Msg.type == "join" then
+				-- Insert the full member object so UpdateMaster can read join_order.
+				table.insert(RetData.PlayerList, {ip_hash = Msg.ip_hash, join_order = Msg.join_order})
+				UpdateMaster()
+				RetData:SendPacketData({{Action = "Internal_UpdateGameData", Data = JSONEncode(RetData.SharedGameData)}}) --Tell everyone what the newest table is incase they dont know
+				RetData:PlayerJoined(Msg.ip_hash)
+
+			elseif Msg.type == "disconnect" then
+				-- table.find won't work on a list of objects; iterate instead.
+				for I, V in ipairs(RetData.PlayerList) do
+					if V.ip_hash == Msg.ip_hash then
+						table.remove(RetData.PlayerList, I)
+						break
+					end
+				end
+				UpdateMaster()
+				RetData:PlayerLeft(Msg.ip_hash)
+
+			elseif Msg.type == "message" then
+				local PacketOk, Dec = pcall(JSONDecode, Msg.data)
+				if not PacketOk or type(Dec) ~= "table" then return end
+
+				-- SendPacketData sends an array of {Action, Data} packets,
+				-- not a single {Action, Data} object; unwrap and handle each.
+				for _, Packet in ipairs(Dec) do
+					if Packet.Action ~= nil and Packet.Data ~= nil then
+						if Packet.Action:sub(1, #TRANSPARENT_PREFIX) == TRANSPARENT_PREFIX then
+							-- Every client handles this directly, no master routing.
+							RetData:PacketTransparent(Msg.ip_hash, Packet.Action, Packet.Data)
+						elseif Msg.ip_hash == RetData.MasterClient then
+							-- Packet from master: deliver to this (non-master) client.
+							ProxiedPacketRecieved(Packet.Action, Packet.Data)
+						elseif RetData.IsMasterClient then
+							-- Packet from a player: raise it to master for processing.
+							RetData:PacketRaised(Msg.ip_hash, Packet.Action, Packet.Data)
+						else
+							-- Packet from a non-master player, seen by another
+							-- non-master client: not master-authoritative, but
+							-- still deliver it instead of dropping it silently.
+							RetData:PacketRecieved(Packet.Action, Packet.Data)
+						end
+					end
+				end
+			end
+		end)
+		local function TableMatches(T1, T2)
+			if T1 == T2 then return true end
+			if type(T1) ~= type(T2) then return false end
+			if type(T1) ~= "table" then return false end
+
+			for Key, Value in pairs(T1) do
+				if type(Value) == "table" and type(T2[Key]) == "table" then
+					if not TableMatches(Value, T2[Key]) then return false end
+				elseif T2[Key] ~= Value then
+					return false
+				end
+			end
+
+			for Key in pairs(T2) do
+				if T1[Key] == nil then return false end
+			end
+
+			return true
+		end
+
+		task.spawn(function()
+			-- Keep alive even if no data is sent (If no data was sent in the last 100 seconds, the server shuts down. Something out of my control)
+			-- This will also be used to help other players realize if they disconnected
+			while task.wait(5) and RetData.Connected do
+				pcall(function()
+					Connection:Send("ping")
+				end)
+			end
+		end)
+
+		task.spawn(function()
+			local GameDataCache = {}
+			while task.wait(1/30) and RetData.Connected do
+				task.spawn(RetData.Update30Hz)
+				task.spawn(function()
+					if tick() - LastUserPing > 15 and #RetData.PlayerList > 1 then -- No response? Connection must've been cut. (If every person sends atleast one, this is nothing to worry about unless everyone crashes or stops responding)
+						RetData:Disconnect()
+					end
+				end)
+				UpdateMaster()
+				if not false and RetData.IsMasterClient then
+					GameDataCache = table.clone(RetData.SharedGameData)
+					RetData:SendPacketData({{Action = "Internal_UpdateGameData", Data = JSONEncode(RetData.SharedGameData)}})
+				end
+			end
+			if not RetData.Connected then
+				pcall(function()
+					CurrentSession = nil
+					Connection:Close()
+				end)
+			end
+		end)
+
+		return RetData
+	end)
+
+	if not Success then
+		warn("JoinOrCreate failed at stage " .. Stage .. "! Error: " .. Result)
+		return {error = "Internal join/start error, check console"}
+	end
+	return Result
+end
+
+function PhotonLib:Disconnect()
+	if CurrentSession then
+		CurrentSession:Disconnect()
+	end
+end
+
+function PhotonLib:InRoom()
+	return CurrentSession ~= nil
+end
+
+function PhotonLib:GetCurrentSession()
+	assert(CurrentSession ~= nil, "You're not in a room!")
+	return CurrentSession
+end
+
+return PhotonLib
