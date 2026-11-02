@@ -28,12 +28,12 @@ local TRANSPARENT_PREFIX = "_Transparent_"
 local CurrentSession = nil
 
 --[[
-Creates or joins a room. Set these up on the returned API:
-	function Room:RoomLoaded()                         -- Fires when the room is loaded.
-	function Room:PlayerJoined(Id)                     -- Fires with the ID that joined.
-	function Room:PlayerLeft(Id)                       -- Fires with the ID that left.
-	function Room:PacketRaised(Id, Action, Data)       -- master-client only, packet information sent to you as the master.
-	function Room:PacketRecieved(Action, Data)         -- Gives packet information from the master-client.
+Creates or joins a room. Set these up on the returned object:
+	function Room:RoomLoaded()
+	function Room:PlayerJoined(Id)
+	function Room:PlayerLeft(Id)
+	function Room:PacketRaised(Id, Action, Data)       -- master-client only
+	function Room:PacketRecieved(Action, Data)
 	function Room:PacketTransparent(Id, Action, Data)  -- every client, Action starts with _Transparent_
 --]]
 function PhotonLib:JoinOrCreate(Room: string, MaxPlayers: number, DefaultGameData)
@@ -135,7 +135,7 @@ function PhotonLib:JoinOrCreate(Room: string, MaxPlayers: number, DefaultGameDat
 
 		local function ProxiedPacketRecieved(Action, Data)
 			if Action == "Internal_UpdateGameData" then
-				--print("Internal Data updated!")
+				print("Internal Data updated!")
 				-- Data arrives as a JSON string from SendPacketData, decode it back.
 				RetData.SharedGameData = JSONDecode(Data)
 				return
@@ -234,6 +234,7 @@ function PhotonLib:JoinOrCreate(Room: string, MaxPlayers: number, DefaultGameDat
 				end
 			end
 		end)
+
 		local function TableMatches(T1, T2)
 			if T1 == T2 then return true end
 			if type(T1) ~= type(T2) then return false end
@@ -312,4 +313,153 @@ function PhotonLib:GetCurrentSession()
 	return CurrentSession
 end
 
-return PhotonLib
+_G.Photon = PhotonLib
+print("set up")
+
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local Session = PhotonLib:JoinOrCreate("_CrossPlay", 50, {
+	["PlayerData"] = {
+		--["hash-here"] = {
+		--	["Position"] = CFrame.new(0,0,0),
+		--	["ClaimedUserId"] = 2
+		--}
+	}
+})
+
+local HumanoidRootPart = nil
+local HasSentSetup = false
+
+-- Every client's own local view of everyone else -- no GameData, no
+-- master authority. Populated purely from transparent broadcasts.
+local PlayerRegistry = {}
+
+function Session:PacketRecieved(Action, Data)
+	--Intentionally unused, position sync happens through PacketTransparent/Update30Hz instead
+end
+
+function Session:PlayerLeft(Id)
+	PlayerRegistry[Id] = nil --Delete the rig
+end
+
+function Session:Update30Hz()
+	for i,v in pairs(PlayerRegistry) do
+		if v.Position and i ~= Session.LocalUniqueIdentifier then
+			local p
+			if game.Workspace:FindFirstChild(v.ClaimedUserId.."_D") then
+				p = game.Workspace[v.ClaimedUserId.."_D"]
+			else
+				p = Instance.new("Part",workspace)
+				p.Size = Vector3.new(1,1,1)
+				p.Anchored = true
+				p.Transparency = 0.5
+				p.Material = Enum.Material.Neon
+				p.Name = v.ClaimedUserId.."_D"
+				p.CanCollide = false
+			end
+			p.CFrame = CFrame.new(unpack(v.Position))
+		end
+	end
+
+	local Claimed = {}
+
+	for i1,v1 in pairs(PlayerRegistry) do
+		for i,v in pairs(workspace:GetChildren()) do
+			if string.find(v.Name,"_D") then
+				if v.Name == v1.ClaimedUserId.."_D" then
+					table.insert(Claimed,v)
+				end
+			end
+		end
+	end
+
+	for i,v in pairs(workspace:GetChildren()) do
+		if string.find(v.Name,"_D") then
+			if not table.find(Claimed,v) then
+				v:Destroy()
+			end
+		end
+	end
+end
+
+function Session:PacketTransparent(Id, Action, Data)
+	if Action == "_Transparent_Setup" then
+		if PlayerRegistry[Id] ~= nil then
+			print(Id.." already has a rig set up, ignoring duplicate Setup.")
+			return
+		end
+
+		local s,e = pcall(function()
+			return JSONDecode(Data)
+		end)
+		local dec
+
+		if s then dec = e else print("Packet was invalid.") return end
+
+		if dec and dec.ClaimedUserId ~= nil and dec.Position then
+			PlayerRegistry[Id] = {
+				["Position"] = dec.Position,
+				["ClaimedUserId"] = tonumber(dec.ClaimedUserId) ~= nil and tonumber(dec.ClaimedUserId) or math.random(10000,99999)
+			}
+		end
+	end
+
+	if Action == "_Transparent_UpdatePlayerPosition" then
+		if PlayerRegistry[Id] == nil then return end
+
+		local s,e = pcall(function()
+			return JSONDecode(Data)
+		end)
+		local dec
+
+		if s then dec = e else print("Packet was invalid.") return end
+
+		if #dec == 12 then
+			local valid = true
+			for i,v in pairs(dec) do
+				if typeof(v) ~= "number" then
+					valid = false
+					break
+				end
+			end
+
+			if valid then
+				PlayerRegistry[Id].Position = dec
+			end
+		end
+	end
+end
+
+local function BindCharacter(Character)
+	HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+
+	if not HasSentSetup then
+		HasSentSetup = true
+		Session:SendPacketData({{
+			Action = "_Transparent_Setup",
+			Data = JSONEncode({
+				ClaimedUserId = LocalPlayer.UserId,
+				Position = {HumanoidRootPart.CFrame:GetComponents()}
+			})
+		}})
+	end
+end
+
+if LocalPlayer.Character then
+	BindCharacter(LocalPlayer.Character)
+end
+LocalPlayer.CharacterAdded:Connect(BindCharacter)
+
+task.spawn(function()
+	while task.wait(1/30) do
+		Session:Update30Hz()
+		if HumanoidRootPart then
+			Session:SendPacketData({{
+				Action = "_Transparent_UpdatePlayerPosition",
+				Data = JSONEncode({HumanoidRootPart.CFrame:GetComponents()})
+			}})
+		end
+	end
+end)
